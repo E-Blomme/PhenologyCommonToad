@@ -1,0 +1,834 @@
+---
+title: "spring migration phenology"
+author: "Ellen Blomme"
+date: "2024-04-18"
+output: html_document
+---
+# IMPORT AND CLEAN THE DATA
+
+```{r setup, include=FALSE}
+# visualization
+library(tidyverse)
+library(hrbrthemes)
+library(viridis)
+
+# setup
+library(readxl)
+library(janitor)
+
+#model
+library(lme4)
+library(lmerTest)
+library(mgcv)
+library(car)
+
+# model selection
+library(lmtest)
+
+# spatial
+library(sf)
+library(sp)
+library(gstat)
+library(ggspatial)
+
+# vizualize the trends
+library(gratia)
+
+# check for correlation
+library(ggcorrplot)
+library(corrplot)
+```
+
+
+## IMPORT AND CLEANING DATA
+```{r import data & cleaning}
+amfib <- read_delim("PaddenoverzetDag_2023_01_25 12_26_50.csv", delim = ";") %>% 
+  clean_names() %>%
+  mutate(line = row_number()) %>%
+  filter(jaar != 2023)
+
+sites <- amfib %>% 
+  distinct(gemeente, naam) %>%
+  mutate(site_code = paste0(naam, ", ", gemeente))
+
+amfib <- amfib %>% 
+  mutate(naam = toupper(gsub("[*]","", naam))) %>%
+  mutate(datum = gsub("1/01/1970", NA, datum)) %>% # There were no toad patrols in 1970
+  mutate_if(is.logical, as.numeric)
+
+sites <- amfib %>% 
+  distinct(provincie, gemeente, naam) %>%
+  mutate(gemeente = gsub("MEEUWEN-GRUITRODE", "MEEUWEN", gemeente)) %>%
+  mutate(gemeente = gsub("GLABBEEK-ZUURBEMDE", "GLABBEEK", gemeente)) %>%
+  mutate(site_code = paste0(naam, ", ", gemeente)) %>%
+  arrange(site_code) %>%
+  mutate(site_id = row_number()) %>%
+  dplyr::select(site_id, site_code, naam, gemeente, provincie)
+
+amfib <- amfib %>% 
+  mutate(site_code = paste0(naam, ", ", gemeente)) %>%
+  left_join(dplyr::select(sites, site_id, site_code), by="site_code")
+
+amfib <- amfib %>% 
+  mutate(jaar = as.numeric(jaar)) %>%
+  mutate(datum = as.Date(datum, "%d/%m/%Y"))
+
+categorie <- read_csv("categorie.csv") %>% 
+  dplyr::select(-c(n))
+
+amfib_long <- amfib %>%
+  dplyr::select(site_id, jaar, datum:salamanders_kolken) %>%
+  pivot_longer(!c(site_id:temperatuur), names_to = "categorie", values_to = "count")
+
+amfib_long <- amfib_long %>% left_join(categorie, by="categorie")
+
+site_jaar_overview_dagen <- amfib_long %>% 
+  filter(!is.na(datum) & !is.na(jaar) & !is.na(site_id)) %>%
+  distinct(site_id, jaar, datum) %>%
+  group_by(site_id, jaar) %>%
+  dplyr::summarise(tot_jaar_dagen = n()) %>%
+  ungroup()
+
+sites_summary <- sites %>%
+  left_join(site_jaar_overview_dagen %>%
+              group_by(site_id) %>% 
+              dplyr::summarise(jaren_alle = n()), by="site_id")
+```
+
+```{r set up the proper dataset}
+# only select the toad counts without any missing values for the toad count
+# REMARK - 1 observation has 2012 for year but 1/1/1970 for date
+bufo_bufo <- amfib_long[amfib_long$soort == "PAD" & 
+                          !is.na(amfib_long$count) & !is.na(amfib_long$datum), ]
+
+# join site info with count data
+bufo_bufo <- merge(x = bufo_bufo, y = sites, 
+                   by = "site_id", all.x = TRUE)
+
+# Molsbroek == Waasmunsterbaan
+bufo_bufo$site_id <- ifelse(bufo_bufo$site_id == 364, 585, bufo_bufo$site_id)
+bufo_bufo$site_code <- ifelse(bufo_bufo$site_code == "MOLSBROEK, LOKEREN", "WAASMUNSTERBAAN, LOKEREN", bufo_bufo$site_code)
+
+# there is only one count for a couple
+bufo_bufo$count <- ifelse(bufo_bufo$geslacht == "K", bufo_bufo$count * 2, bufo_bufo$count) 
+
+# change the year of december to the following year so it is correct to calculate
+# the shift in phenology
+bufo_bufo$jaar <- ifelse(format(bufo_bufo$datum, "%m") == 12, 
+                          bufo_bufo$jaar + 1, 
+                          bufo_bufo$jaar)
+
+# Calculate the cumulative count for a date per location per year
+bufo_bufo <- bufo_bufo %>%
+  # remove all counts of toads going back to the forest/terrestrial habitat
+  filter(categorie != "gew_pad_terug") %>% 
+  arrange(site_id, jaar, datum) %>% 
+  group_by(site_id, jaar) %>%
+  # total amount of migrated toads migrated on that day (per location per year)
+  mutate(cumulative_count = cumsum(count)) %>% 
+  ungroup()
+```
+
+```{r only look at locations with more than 5 years of data}
+# remove sites with < 5 years of counts
+bufo_bufo <- filter(bufo_bufo, site_id %in% 
+                 sites_summary$site_id[sites_summary$jaren_alle > 5])
+sites_summary <- filter(sites_summary, site_id %in% 
+                          sites_summary$site_id[sites_summary$jaren_alle > 5])
+```
+
+
+# EXPLORATION
+
+# DISTRIBUTION OF SAMPLING POINTS
+```{r read in spatial data}
+gemeentes <- st_read("Gemeentes_Vlaanderen.shp") %>%
+  rownames_to_column("FID") %>% dplyr::select(-FID_) # GIS data
+
+# clean the data
+acties <- read_xlsx("PaddenoverzetActies_2023_01_25 12_26_27.xlsx") %>% 
+  clean_names() %>%
+  mutate(line = row_number()) %>%
+  mutate(naam = toupper(gsub("[*]","", naam))) %>%
+  mutate(gemeente = gsub("MEEUWEN-GRUITRODE", "MEEUWEN", gemeente)) %>%
+  mutate(gemeente = gsub("GLABBEEK-ZUURBEMDE", "GLABBEEK", gemeente)) %>%
+  mutate(site_code = paste0(naam, ", ", gemeente)) # all toad actions
+# filter(!(latitude == 0 | is.na(latitude)) &
+# !(longitude == 0 | is.na(longitude))) # remove all incomplete coordinates 
+# use, to find the empty coordinates
+
+
+# fulfill the coordinates of locations
+acties[acties$site_code == "BAVERSTRAAT (ELDEREN), TONGEREN",
+       "latitude"] <- 50.793217874202576
+acties[acties$site_code == "BAVERSTRAAT (ELDEREN), TONGEREN",
+       "longitude"] <- 5.487557081429292
+
+acties[acties$site_code == "BORGGRAVEVIJVERSTRAAT, HASSELT",
+       "latitude"] <- 50.94910703887022
+acties[acties$site_code == "BORGGRAVEVIJVERSTRAAT, HASSELT",
+       "longitude"] <- 5.3737536814389975
+
+acties[acties$site_code == "BROEKSTRAAT, FONTEINSTRAAT, WILLEBROEK",
+       "latitude"] <- 51.059856735134396
+acties[acties$site_code == "BROEKSTRAAT, FONTEINSTRAAT, WILLEBROEK",
+       "longitude"] <- 4.3811436967902
+
+acties[acties$site_code == "OUDE GENTWEG, AALTER",
+       "latitude"] <- 51.07913415602838
+acties[acties$site_code == "OUDE GENTWEG, AALTER",
+       "longitude"] <- 3.477390025627469
+
+acties[acties$site_code == "SULFERBERG (WESTOUTER), HEUVELLAND",
+       "latitude"] <- 50.79674300378389
+acties[acties$site_code == "SULFERBERG (WESTOUTER), HEUVELLAND",
+       "longitude"] <- 2.767450954685736
+```
+
+```{r make a map}
+site_coords.sf <- acties %>%
+  mutate_at(c("latitude", "longitude"), ~na_if(., 0)) %>%
+  group_by(site_code) %>%
+  summarise(lat = mean(latitude, nan.rm = T),
+            lon = mean(longitude, nan.rm = T))%>%
+  filter(!is.na(lat)) %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, agr = "constant")
+
+# sample sizes and longest time series
+site.sf <- site_coords.sf %>% 
+  right_join(sites_summary, by="site_code")
+
+ggplot() +
+  theme_bw() + 
+  geom_sf(data = st_geometry(gemeentes), colour = "grey", fill=NA, lwd = .5) +
+  geom_sf(data = site.sf, shape=19, size = 1, alpha=8)+
+    annotation_scale(location = "tl", width_hint = 0.4) +
+    annotation_north_arrow(location = "tl", which_north = "true", 
+        pad_x = unit(0, "cm"), pad_y = unit(0.6, "cm"),
+        style = north_arrow_fancy_orienteering)
+
+# ggsave("figure 1.jpeg", width = 13.9, height = 6,  units = "cm", dpi=600)
+```
+
+
+# CALCULATE BEGIN, PEAK, END
+
+```{r median 5th and 95th percentile}
+bufo <- bufo_bufo %>%
+  dplyr::rename(year = jaar) %>%
+  group_by(year, site_id, datum) %>%
+  dplyr::summarise(count = sum(count), # sum of dead and migrating toads
+                   migr_toads = max(cumulative_count), # total migrated toads on that day
+                   ) 
+
+# Get the estimates for the median, 5th and 95th percentile per id and year
+estimate <- bufo %>%
+  group_by(year, site_id) %>%
+  dplyr::summarise(median_count = median(migr_toads),
+                   first_perc = quantile(migr_toads, 0.05), 
+                   #quantile(count, 0.05)
+                   last_perc = quantile(migr_toads, 0.95),
+                   tot_count = sum(count),
+                   tot_days = n_distinct(datum)) %>%
+  ungroup()
+
+# Merge the datasets based on year and location
+merged_bufo <- merge(bufo_bufo, estimate, by.x=c("site_id", "jaar"), 
+                     by.y=c("site_id", "year"))
+
+# remove columns that are not useful
+merged_bufo <- subset(merged_bufo, select = -c(tijd, regen, soort,
+                                               beweging, geslacht, naam, 
+                                               gemeente, provincie))
+
+# remove columns with missing id
+merged_bufo <- merged_bufo[!is.na(merged_bufo$site_id), ]
+```
+
+
+
+```{r min date per statistic}
+# find the date for the peak of the migration
+peak_data <- merged_bufo %>%
+  dplyr::rename(year = jaar) %>%
+  group_by(site_id, year) %>%
+  # select the first day where the amount of toads crossed is higher than the
+  # median count
+  filter(cumulative_count >= median_count) %>%
+  # The day of the year as a decimal number (range 001 to 366).
+  summarise(peak = as.numeric(format(min(datum), format = "%j"))) 
+
+# find the date for the start of the migration, similar to the peak
+begin_data <- merged_bufo %>%
+  dplyr::rename(year = jaar) %>%
+  group_by(site_id, year) %>%
+  filter(cumulative_count >= first_perc) %>%
+  summarise(onset = as.numeric(format(min(datum), format = "%j")))
+
+# find the date for the end of the migration, similar to the peak
+end_data <- merged_bufo %>%
+  dplyr::rename(year = jaar) %>%
+  group_by(site_id, year) %>%
+  filter(cumulative_count >= last_perc) %>%
+  summarise(end = as.numeric(format(min(datum), format = "%j")))
+```
+
+```{r joined dataset (amount of rows)}
+phenology <- begin_data %>%
+  left_join(peak_data, by = c("site_id", "year")) %>%
+  left_join(end_data, by = c("site_id", "year")) %>%
+  left_join(estimate[, c("site_id", "year", 
+                         "tot_count", "tot_days")], 
+            by = c("site_id", "year")) %>%
+  mutate(year_center = year - 2020,
+         site_id = as.factor(site_id),
+         migration_length = end - onset + 1) %>% # filter(tot_days > 1)
+  filter(migration_length > 1)
+```
+
+
+
+
+# ANALYSIS MIGRATION PHENOLOGY
+Models testing whether the beginning / peak / end of breeding migrations shifted
+over the years. As the migration may shift depending on the location, we use a 
+random intercept for each location.
+
+## MIXED MODELS
+
+### ONSET
+```{r model of STARTdate}
+mm_onset <- lmer(onset ~ year_center + (1|site_id),
+              data = phenology)
+
+complex <- lmer(onset ~ year_center + (1+year_center|site_id),
+              data = phenology) # is the change consistent
+
+summary(mm_onset)
+```
+
+```{r model selection of STARTdate}
+# Are the populations reacting in the same way?
+#H0: The full model and the nested model fit the data equally well.
+#Ha: The full model fits the data significantly better than the nested model.
+lrtest(mm_onset, complex)
+```
+
+```{r onset assumptions}
+plot(phenology$year_center, phenology$onset)
+lines(smooth.spline(phenology$onset~phenology$year_center))
+
+# Residual Plot
+residuals <- resid(mm_onset)
+fitted_values <- fitted(mm_onset)
+
+# Plot residuals against fitted values
+plot(fitted_values, residuals, xlab = "Fitted Values", ylab = "Residuals", main = "Residual Plot")
+abline(h=0)
+
+# Normality Check
+# Q-Q Plot
+qqPlot(residuals)
+hist(residuals, breaks = 60)
+shapiro.test(residuals)
+```
+
+
+### PEAK
+```{r model of PEAKdate}
+mm_peak <- lmer(peak ~ year_center + (1|site_id),
+              data = phenology)
+complex_peak <- lmer(peak ~ year_center + (1+year_center|site_id),
+              data = phenology)
+
+summary(mm_peak)
+```
+
+```{r model selection of PEAK}
+# Are the populations reacting in the same way
+#H0: You should use the complex model.
+#Ha: You should use the nested model.
+lrtest(mm_peak, complex_peak)
+```
+
+```{r peak assumptions}
+plot(phenology$year_center, phenology$peak)
+lines(smooth.spline(phenology$peak~phenology$year_center))
+
+# Residual Plot
+residuals <- resid(mm_peak)
+fitted_values <- fitted(mm_peak)
+
+# Plot residuals against fitted values
+plot(fitted_values, residuals, xlab = "Fitted Values", ylab = "Residuals", main = "Residual Plot")
+abline(h=0)
+
+# Normality Check
+# Q-Q Plot
+qqPlot(residuals)
+hist(residuals, breaks = 60)
+shapiro.test(residuals)
+```
+
+
+### END
+```{r model of ENDdate}
+mm_end <- lmer(end ~ year_center + (1|site_id),
+              data = phenology)
+complex_end <- lmer(end ~ year_center + (1+year_center|site_id),
+              data = phenology)
+
+summary(mm_end)
+sum_end <- summary(complex_end)
+sum(sum_end$coefficients[, "Pr(>|t|)"] <= 0.05)
+```
+
+```{r model selection of END}
+# Are the populations reacting in the same way
+#H0: You should use the complex model.
+#Ha: You should use the nested model.
+lrtest(mm_end, complex_end)
+```
+
+
+```{r end assumptions}
+plot(phenology$year_center, phenology$end)
+lines(smooth.spline(phenology$end~phenology$year_center))
+
+# Residual Plot
+residuals <- resid(mm_end)
+fitted_values <- fitted(mm_end)
+
+# Plot residuals against fitted values
+plot(fitted_values, residuals, xlab = "Fitted Values", ylab = "Residuals", main = "Residual Plot")
+abline(h=0)
+
+# Normality Check
+# Q-Q Plot
+qqPlot(residuals)
+hist(residuals, breaks = 60)
+shapiro.test(residuals)
+```
+
+
+
+### DURATION
+```{r model of migration DURATION}
+mm_length <- lmer(migration_length ~ year_center + (1|site_id),
+                  data = phenology)
+complex_length <- lmer(migration_length ~ year_center + (1+year_center|site_id),
+                       data = phenology)
+summary(mm_length)
+```
+
+```{r model selection of DURATION}
+# Are the populations reacting in the same way?
+#H0: You should use the complex model.
+#Ha: You should use the nested model.
+lrtest(mm_length, complex_length)
+```
+
+```{r is there variation over the years in duration}
+gamm_int <- gam(migration_length ~ s(year_center) + s(site_id, bs = "re") + s(site_id,
+    year_center, bs = "re"), data = phenology, method = "REML")
+lmm_int <- gam(migration_length ~ year_center + s(site_id, bs = "re") + s(site_id,
+    year_center, bs = "re"), data = phenology, method = "REML")
+
+# Is the duration variable?
+#H0: You should use the complex model.
+#Ha: You should use the nested model.
+lrtest(lmm_int, gamm_int)
+```
+
+```{r duration assumptions}
+plot(phenology$year_center, phenology$migration_length)
+lines(smooth.spline(phenology$migration_length~phenology$year_center))
+
+# Residual Plot
+residuals <- resid(mm_length)
+fitted_values <- fitted(mm_length)
+
+# Plot residuals against fitted values
+plot(fitted_values, residuals, xlab = "Fitted Values", ylab = "Residuals", main = "Residual Plot")
+abline(h=0)
+
+# Normality Check
+# Q-Q Plot
+qqPlot(residuals)
+hist(residuals, breaks = 60)
+shapiro.test(residuals)
+```
+
+# MODEL VISUALISATION
+```{r plots dates}
+phenology$pred_start <- predict(mm_onset, newdata = phenology, re.form = NA)
+phenology$pred_end <- predict(mm_end, newdata = phenology, re.form = NA)
+phenology$pred_peak <- predict(mm_peak, newdata = phenology, re.form = NA)
+
+plot_pheno <- phenology %>%
+  pivot_longer(cols = onset:end, 
+               names_to = "date", 
+               values_to = "day_of_year") 
+plot_pheno$date <- factor(plot_pheno$date, levels = c("onset", "peak", "end"))
+
+ggplot(plot_pheno, aes(x = year, y = day_of_year, color = date))  +  
+  theme_classic() +
+  theme(legend.position = c(0.1, 0.23)) +
+  scale_color_manual(values = c("onset" = "darkgreen", 
+                                "peak" = "deepskyblue2", 
+                                "end" = "firebrick")) +
+  geom_point(size = 1) +
+  geom_line(aes(y = pred_start), 
+            color = "darkgreen", size = 1) +
+  geom_line(aes(y = pred_peak), 
+            color = "deepskyblue2", size = 1) +
+  geom_line(aes(y = pred_end), 
+            color = "firebrick", size = 1) +
+  labs(x = "Year", y = "Migration date (day of the year)")
+
+
+# ggsave("figure 2.jpeg", width = 13.9, height = 8,  units = "cm", dpi=600)
+```
+
+
+# SPATIAL CORRELATION
+check if we need to take into account any spatial correlation.
+```{r combine with spatial data}
+# combine dataset
+sites_loc <- sites_summary %>%
+  left_join(acties[, c("site_code", "longitude", "latitude")], by = "site_code") %>%
+  filter(!(latitude == 0 | is.na(latitude)) &
+           !(longitude == 0 | is.na(longitude))) %>%
+  distinct(site_id, .keep_all = TRUE)
+
+sites_loc$site_id <- as.factor(sites_loc$site_id)
+```
+
+```{r from wgs84 to epsg31370}
+sites_loc <- st_as_sf(sites_loc, coords = c("longitude", "latitude"), 
+                          crs = 4326, agr = "constant") # WGS84 = EPSG4326
+sf_data <- st_transform(sites_loc, crs = 31370) # Belgian Lambert 72
+
+coord <- st_coordinates(sf_data)
+
+sf_data <- cbind(sf_data, coord)
+
+colnames(sf_data)[8] <- "latitude"
+colnames(sf_data)[7] <- "longitude"
+```
+
+
+```{r spatial correlation}
+# combine dataset
+spat <- phenology %>%
+  left_join(sf_data[, c("site_id", "longitude", "latitude")], by = "site_id")
+phenology <- phenology %>%
+  left_join(sf_data[, c("site_id", "longitude", "latitude")], by = "site_id")
+
+# Create a spatial object
+coordinates(spat) <- c("longitude", "latitude") # needs to be in Lambert 1972
+
+plot(variogram(spat$peak ~ 1, locations = coordinates(spat), data = spat, cloud = F), 
+    type = "b")
+```
+Based on the correlogram, there is no spatial correlation.
+
+
+# RELATION WITH TEMPERATURE
+
+```{r read in temperature data and merge}
+temperature <- read_xlsx("temperature.xlsx")
+
+# adapt to the right structure
+temperature$TEMP_CH_0H_MIN <- as.numeric(temperature$TEMP_CH_0H_MIN)
+temperature <- na.omit(temperature)
+temperature$TEMP_CH_0H_MAX <- as.numeric(temperature$TEMP_CH_0H_MAX)
+temperature$TEMP_CH_0H_AVG <- as.numeric(temperature$TEMP_CH_0H_AVG)
+temperature$TIMESTAMP <- as.Date(temperature$TIMESTAMP, format = "%Y-%m-%d")
+
+# Extract day of the year
+temperature$day_of_year <- as.integer(yday(temperature$TIMESTAMP))
+
+# Extract year
+temperature$year <- as.integer(year(temperature$TIMESTAMP))
+
+# add temperature meterological winter
+## Make sure the winter is included in the same toad season
+temperature$year <- ifelse(format(temperature$TIMESTAMP, "%m") == 12, 
+                          temperature$year + 1, 
+                          temperature$year)
+temperature$day_of_year <- ifelse(format(temperature$TIMESTAMP, "%m") == 12, 
+                          temperature$day_of_year - 365, 
+                          temperature$day_of_year)
+## select only winter months
+meteorological_winter <- subset(temperature, 
+                                format(TIMESTAMP, "%m") %in% c("12", "01", "02"))
+
+# Calculate the mean temperature for each year
+meteorological_winter <- aggregate(cbind(TEMP_CH_0H_MIN, TEMP_CH_0H_AVG, TEMP_CH_0H_MAX) 
+                       ~ year, data = meteorological_winter, FUN = mean)
+
+names(meteorological_winter) <- c("year", "winter_min", 
+                                  "winter_avg", "winter_max")
+```
+
+```{r ONSETdata}
+onset_temp <- phenology %>%
+  left_join(meteorological_winter, by = "year") %>%
+  left_join(temperature, by = c("year" = "year", "onset" = "day_of_year")) %>%
+  dplyr::rename(T_min = TEMP_CH_0H_MIN,
+                T_avg = TEMP_CH_0H_AVG, 
+                T_max = TEMP_CH_0H_MAX)
+
+onset_temp$mean_week <-  rep(NA, nrow(onset_temp))
+onset_temp$mean_month <-  rep(NA, nrow(onset_temp))
+
+for (index in 1:nrow(onset_temp)) {
+  # select the data from the dataset
+  observation <- onset_temp[index, ]
+  
+  # select the year and the date
+  jaar <- observation$year
+  dag <- observation$onset
+  
+  # calculate the mean avg temperature a week/month before the onset
+  weekly_T <- subset(temperature[temperature$year == jaar,], 
+                     day_of_year >= dag - 7 & day_of_year <= dag)
+  monthly_T <- subset(temperature[temperature$year == jaar,],
+                      day_of_year >= dag - 30 & day_of_year <= dag)
+  
+  # save mean temperature
+  onset_temp[index, ]$mean_week <- mean(weekly_T$TEMP_CH_0H_AVG)
+  onset_temp[index, ]$mean_month <- mean(monthly_T$TEMP_CH_0H_AVG)
+}
+```
+
+
+
+```{r PEAKdata}
+peak_temp <- phenology %>%
+  left_join(meteorological_winter, by = "year") %>%
+  left_join(temperature, by = c("year" = "year", "peak" = "day_of_year")) %>%
+  dplyr::rename(T_min = TEMP_CH_0H_MIN,
+                T_avg = TEMP_CH_0H_AVG, 
+                T_max = TEMP_CH_0H_MAX)
+
+peak_temp$mean_week <-  rep(NA, nrow(peak_temp))
+peak_temp$mean_month <-  rep(NA, nrow(peak_temp))
+
+for (index in 1:nrow(peak_temp)) {
+  # select the data from the dataset
+  observation <- peak_temp[index, ]
+  
+  # select the year and the date
+  jaar <- observation$year
+  dag <- observation$peak
+  
+  weekly_T <- subset(temperature[temperature$year == jaar,], 
+                     day_of_year >= dag - 7 & day_of_year <= dag)
+  monthly_T <- subset(temperature[temperature$year == jaar,],
+                      day_of_year >= dag - 30 & day_of_year <= dag)
+  
+  peak_temp[index, ]$mean_week <- mean(weekly_T$TEMP_CH_0H_AVG)
+  peak_temp[index, ]$mean_month <- mean(monthly_T$TEMP_CH_0H_AVG)
+}
+```
+
+```{r ENDdata}
+end_temp <- phenology %>%
+  left_join(meteorological_winter, by = "year") %>%
+  left_join(temperature, by = c("year" = "year", "end" = "day_of_year")) %>%
+  dplyr::rename(T_min = TEMP_CH_0H_MIN,
+                T_avg = TEMP_CH_0H_AVG, 
+                T_max = TEMP_CH_0H_MAX)
+
+end_temp$mean_week <-  rep(NA, nrow(end_temp))
+end_temp$mean_month <-  rep(NA, nrow(end_temp))
+
+for (index in 1:nrow(end_temp)) {
+  # select the data from the dataset
+  observation <- end_temp[index, ]
+  
+  # select the year and the date
+  jaar <- observation$year
+  dag <- observation$end
+  
+  # calculate the mean avg temperature a week/month before the onset
+  weekly_T <- subset(temperature[temperature$year == jaar,], 
+                     day_of_year >= dag - 7 & day_of_year <= dag)
+  monthly_T <- subset(temperature[temperature$year == jaar,],
+                      day_of_year >= dag - 30 & day_of_year <= dag)
+  
+  # save mean temperature
+  end_temp[index, ]$mean_week <- mean(weekly_T$TEMP_CH_0H_AVG)
+  end_temp[index, ]$mean_month <- mean(monthly_T$TEMP_CH_0H_AVG)
+}
+```
+
+
+## MODEL
+### ONSET
+```{r effect of temperature on ONSET}
+onset_week <- lmer(onset ~ mean_week + (1|site_id),
+                 data = onset_temp)
+summary(onset_week)
+
+onset_month <- lmer(onset ~ mean_month + (1|site_id),
+                 data = onset_temp)
+summary(onset_month)
+
+onset_winter <- lmer(onset ~ winter_avg + (1|site_id),
+                 data = onset_temp)
+summary(onset_winter)
+```
+
+```{r Tonset assumptions}
+plot(onset_temp$winter_avg, onset_temp$onset)
+lines(smooth.spline(onset_temp$onset~onset_temp$winter_avg))
+
+# Residual Plot
+residuals <- resid(onset_winter)
+fitted_values <- fitted(onset_winter)
+
+# Plot residuals against fitted values
+plot(fitted_values, residuals, xlab = "Fitted Values", ylab = "Residuals", main = "Residual Plot")
+abline(h=0)
+
+# Normality Check
+# Q-Q Plot
+qqPlot(residuals)
+hist(residuals, breaks = 32)
+shapiro.test(residuals)
+```
+
+
+### PEAK
+```{r effect of temperature on PEAK}
+peak_week <- lmer(peak ~ mean_week + (1|site_id),
+                 data = peak_temp)
+summary(peak_week)
+
+peak_month <- lmer(peak ~ mean_month + (1|site_id),
+                 data = peak_temp)
+summary(peak_month)
+
+peak_winter <- lmer(peak ~ winter_avg + (1|site_id),
+                 data = peak_temp)
+summary(peak_winter)
+```
+
+
+```{r Tpeak assumptions}
+plot(peak_temp$winter_avg, peak_temp$peak)
+lines(smooth.spline(peak_temp$peak ~ peak_temp$winter_avg))
+
+# Residual Plot
+residuals <- resid(peak_winter)
+fitted_values <- fitted(peak_winter)
+
+# Plot residuals against fitted values
+plot(fitted_values, residuals, xlab = "Fitted Values", ylab = "Residuals", main = "Residual Plot")
+abline(h=0)
+
+# Normality Check
+# Q-Q Plot
+qqPlot(residuals)
+hist(residuals, breaks = 32)
+shapiro.test(residuals)
+```
+
+
+
+### END
+```{r effect of temperature on END}
+end_week <- lmer(end ~ mean_week + (1|site_id),
+                 data = end_temp)
+summary(end_week)
+
+end_month <- lmer(end ~ mean_month + (1|site_id),
+                 data = end_temp)
+summary(end_month)
+
+end_winter <- lmer(end ~ winter_avg + (1|site_id),
+                 data = end_temp)
+summary(end_winter)
+```
+
+```{r Tend assumptions}
+plot(end_temp$winter_avg, end_temp$end)
+lines(smooth.spline(end_temp$end ~ end_temp$winter_avg))
+
+# Residual Plot
+residuals <- resid(end_winter)
+fitted_values <- fitted(end_winter)
+
+# Plot residuals against fitted values
+plot(fitted_values, residuals, xlab = "Fitted Values", ylab = "Residuals", main = "Residual Plot")
+abline(h=0)
+
+# Normality Check
+# Q-Q Plot
+qqPlot(residuals)
+hist(residuals, breaks = 60)
+shapiro.test(residuals)
+```
+
+
+### DURATION
+```{r effect of temperature on DURATION}
+duration_winter <- lmer(migration_length ~ winter_avg + (1|site_id),
+                 data = end_temp)
+summary(duration_winter)
+```
+
+```{r Tduration assumptions}
+plot(end_temp$winter_avg, end_temp$migration_length)
+lines(smooth.spline(end_temp$migration_length ~ end_temp$winter_avg))
+
+# Residual Plot
+residuals <- resid(duration_winter)
+fitted_values <- fitted(duration_winter)
+
+# Plot residuals against fitted values
+plot(fitted_values, residuals, xlab = "Fitted Values", ylab = "Residuals", main = "Residual Plot")
+abline(h=0)
+
+# Normality Check
+# Q-Q Plot
+qqPlot(residuals)
+hist(residuals, breaks = 60)
+shapiro.test(residuals)
+```
+
+## TEMPERATURE VISUALIZATIONS
+```{r plots temperatures}
+onset_temp$pred_week <- predict(onset_week, newdata = onset_temp, re.form = NA)
+onset_temp$pred_month <- predict(onset_month, newdata = onset_temp, re.form = NA)
+onset_temp$pred_winter <- predict(onset_winter, newdata = onset_temp, re.form = NA)
+
+plot_temp <- onset_temp %>%
+  pivot_longer(cols = c(winter_avg, mean_month, mean_week), 
+               names_to = "period", 
+               values_to = "temperature") %>%
+  select(site_id, onset, period, temperature, pred_week, pred_month, pred_winter)
+plot_temp$period <- factor(plot_temp$period, levels = c("winter_avg", "mean_month", "mean_week"))
+
+ggplot(plot_temp, aes(x = temperature, y = onset, color = period))  +  
+  theme_classic() +
+  theme(legend.position = c(0.123, 0.22)) +
+  scale_color_manual(values = c("mean_week" = "darkgreen", 
+                                "winter_avg" = "deepskyblue2", 
+                                "mean_month" = "firebrick")) +
+  geom_point(size = 1) +
+  geom_line(data = plot_temp[plot_temp$period == "mean_week",], aes(y = pred_week), 
+            color = "darkgreen", size = 1) +
+  geom_line(data = plot_temp[plot_temp$period == "mean_month",], aes(y = pred_month), 
+            color = "firebrick", size = 1) +
+  geom_line(data = plot_temp[plot_temp$period == "winter_avg",], aes(y = pred_winter), 
+            color = "deepskyblue2", size = 1) + 
+  labs(x = "Temperature (°C)", y = "Onset migration date (day of the year)")
+  #, title = "Shift in migration phenology of the common toad (Bufo bufo)"
+
+
+ggsave("figure 3.jpeg", width = 13.9, height = 8,  units = "cm", dpi=600)
+```
