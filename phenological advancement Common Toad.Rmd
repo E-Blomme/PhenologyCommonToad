@@ -198,14 +198,57 @@ site_coords.sf <- acties %>%
 site.sf <- site_coords.sf %>% 
   right_join(sites_summary, by="site_code")
 
-ggplot() +
+bbox_VL <- st_bbox(gemeentes %>% st_transform(crs=4326))
+
+#making a map of Flanders with the locations
+main_map <- ggplot() +
   theme_bw() + 
-  geom_sf(data = st_geometry(gemeentes), colour = "grey", fill=NA, lwd = .5) +
+  geom_sf(data = st_geometry(gemeentes %>% st_transform(crs=4326)), colour = "grey", fill=NA, lwd = .5) +
   geom_sf(data = site.sf, shape=19, size = 1, alpha=8)+
-    annotation_scale(location = "tl", width_hint = 0.4) +
-    annotation_north_arrow(location = "tl", which_north = "true", 
-        pad_x = unit(0, "cm"), pad_y = unit(0.6, "cm"),
-        style = north_arrow_fancy_orienteering)
+  scale_x_continuous(limits = c(2.66, 5.8), position="top") +
+  scale_y_continuous(limits = c(50.15, 51.48)) +
+  annotation_scale(location="tl", width_hint = 0.6,
+                   pad_y = unit(6.9, "cm")) +
+  annotation_north_arrow(location = "tl", which_north = "true", 
+                         pad_x = unit(0.1, "cm"), pad_y = unit(0.4, "cm"),
+                         style = north_arrow_fancy_orienteering)
+
+main_map
+
+
+#making a map of NW-Europe for situating Flanders
+
+
+world <- ne_countries(scale="large", returnclass="sf")
+target_crs <- 4326#"+proj=longlat" #+proj=longlat CRS("EPSG:4236)
+
+world_wgs84 <- world %>% st_transform(crs = target_crs)
+
+inset_map <- world_wgs84 %>% ggplot() + geom_sf() + #map of europe
+  scale_x_continuous(limits = c(-5, 15)) +
+  scale_y_continuous(limits = c(48, 55)) +
+  geom_rect(data = data.frame(),
+            aes(xmin = bbox_VL$xmin, xmax = bbox_VL$xmax, ymin = bbox_VL$ymin, ymax = bbox_VL$ymax),
+            colour = "black", fill=NA, size=1)+
+  theme_bw()+
+  theme(plot.background = element_rect(colour = "black", fill=NA, linewidth=0.5))
+
+inset_map
+
+
+
+ggdraw(main_map) +
+  draw_plot(
+    {
+      inset_map
+    },
+    # The distance along a (0,1) x-axis to draw the left edge of the plot
+    x = 0.605, 
+    # The distance along a (0,1) y-axis to draw the bottom edge of the plot
+    y = 0.12,
+    # The width and height of the plot expressed as proportion of the entire ggdraw object
+    width = 0.35, 
+    height = 0.35)
 
 # ggsave("figure 1.jpeg", width = 13.9, height = 6,  units = "cm", dpi=600)
 ```
