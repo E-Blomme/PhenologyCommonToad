@@ -3,6 +3,8 @@ title: "spring migration phenology"
 author: "Ellen Blomme"
 date: "2024-04-18"
 output: html_document
+editor_options: 
+  chunk_output_type: inline
 ---
 # IMPORT AND CLEAN THE DATA
 
@@ -11,6 +13,8 @@ output: html_document
 library(tidyverse)
 library(hrbrthemes)
 library(viridis)
+library(rnaturalearth) #world data
+library(cowplot)
 
 # setup
 library(readxl)
@@ -33,6 +37,7 @@ library(ggspatial)
 
 # vizualize the trends
 library(gratia)
+library(ggpubr)
 
 # check for correlation
 library(ggcorrplot)
@@ -113,7 +118,7 @@ bufo_bufo$site_code <- ifelse(bufo_bufo$site_code == "MOLSBROEK, LOKEREN", "WAAS
 bufo_bufo$count <- ifelse(bufo_bufo$geslacht == "K", bufo_bufo$count * 2, bufo_bufo$count) 
 
 # change the year of december to the following year so it is correct to calculate
-# the shift in phenology
+# the shift in phenology (december-april = 1 toad season)
 bufo_bufo$jaar <- ifelse(format(bufo_bufo$datum, "%m") == 12, 
                           bufo_bufo$jaar + 1, 
                           bufo_bufo$jaar)
@@ -142,8 +147,7 @@ sites_summary <- filter(sites_summary, site_id %in%
 
 # DISTRIBUTION OF SAMPLING POINTS
 ```{r read in spatial data}
-gemeentes <- st_read("Gemeentes_Vlaanderen.shp") %>%
-  rownames_to_column("FID") %>% dplyr::select(-FID_) # GIS data
+provincies <- st_read("shapefiles/Refprv.shp")
 
 # clean the data
 acties <- read_xlsx("PaddenoverzetActies_2023_01_25 12_26_27.xlsx") %>% 
@@ -153,37 +157,51 @@ acties <- read_xlsx("PaddenoverzetActies_2023_01_25 12_26_27.xlsx") %>%
   mutate(gemeente = gsub("MEEUWEN-GRUITRODE", "MEEUWEN", gemeente)) %>%
   mutate(gemeente = gsub("GLABBEEK-ZUURBEMDE", "GLABBEEK", gemeente)) %>%
   mutate(site_code = paste0(naam, ", ", gemeente)) # all toad actions
-# filter(!(latitude == 0 | is.na(latitude)) &
-# !(longitude == 0 | is.na(longitude))) # remove all incomplete coordinates 
-# use, to find the empty coordinates
-
-
-# fulfill the coordinates of locations
-acties[acties$site_code == "BAVERSTRAAT (ELDEREN), TONGEREN",
-       "latitude"] <- 50.793217874202576
-acties[acties$site_code == "BAVERSTRAAT (ELDEREN), TONGEREN",
-       "longitude"] <- 5.487557081429292
-
-acties[acties$site_code == "BORGGRAVEVIJVERSTRAAT, HASSELT",
-       "latitude"] <- 50.94910703887022
-acties[acties$site_code == "BORGGRAVEVIJVERSTRAAT, HASSELT",
-       "longitude"] <- 5.3737536814389975
-
-acties[acties$site_code == "BROEKSTRAAT, FONTEINSTRAAT, WILLEBROEK",
-       "latitude"] <- 51.059856735134396
-acties[acties$site_code == "BROEKSTRAAT, FONTEINSTRAAT, WILLEBROEK",
-       "longitude"] <- 4.3811436967902
-
-acties[acties$site_code == "OUDE GENTWEG, AALTER",
-       "latitude"] <- 51.07913415602838
-acties[acties$site_code == "OUDE GENTWEG, AALTER",
-       "longitude"] <- 3.477390025627469
-
-acties[acties$site_code == "SULFERBERG (WESTOUTER), HEUVELLAND",
-       "latitude"] <- 50.79674300378389
-acties[acties$site_code == "SULFERBERG (WESTOUTER), HEUVELLAND",
-       "longitude"] <- 2.767450954685736
 ```
+
+```{r add grid 5km-5km}
+centroids <- read_delim("climateGrid/climategrid_pixel_metadata.csv", delim = ";") %>%
+  st_as_sf(coords = c("PIXEL_LON_CENTER", "PIXEL_LAT_CENTER"), crs = 4326)
+
+# Transform to a suitable UTM zone (e.g., based on your region)
+utm_crs <- 3812  # Belgium Lambert 2008
+centroids_utm <- st_transform(centroids, crs = utm_crs)
+
+# Define the side length for each grid cell (5 km)
+cell_size <- 5000  # 5 km in meters
+
+# Create 5 km x 5 km squares around each centroid
+create_square <- function(point, size) {
+  x <- st_coordinates(point)[, 1]
+  y <- st_coordinates(point)[, 2]
+  
+  # Create a polygon from the four corners of the square
+  square <- st_polygon(list(matrix(c(
+    x - size / 2, y - size / 2,
+    x + size / 2, y - size / 2,
+    x + size / 2, y + size / 2,
+    x - size / 2, y + size / 2,
+    x - size / 2, y - size / 2
+  ), ncol = 2, byrow = TRUE)))
+  
+  st_sfc(square, crs = st_crs(point))
+}
+
+# Apply the function to each centroid to create the grid cells
+grid_cells <- centroids_utm %>%
+  rowwise() %>%
+  mutate(geometry = create_square(geometry, cell_size)) %>%
+  st_as_sf()
+
+# Reproject grid cells back to WGS84
+grid_cells_wgs84 <- st_transform(grid_cells, crs = 4326)
+
+region <- st_geometry(provincies %>% st_transform(crs = 4326))
+
+# Filter grid cells that intersect with the region shapefile
+grid_cells_filtered <- st_intersection(grid_cells_wgs84, region)
+```
+
 
 ```{r make a map}
 site_coords.sf <- acties %>%
@@ -196,29 +214,28 @@ site_coords.sf <- acties %>%
 
 # sample sizes and longest time series
 site.sf <- site_coords.sf %>% 
-  right_join(sites_summary, by="site_code")
+  right_join(sites_summary, by="site_code") %>%
+  filter(site_id != 364) # Waasmunsterbaan == Molsbroek; 585 == 364
 
-bbox_VL <- st_bbox(gemeentes %>% st_transform(crs=4326))
+bbox_VL <- st_bbox(provincies %>% st_transform(crs=4326))
 
 #making a map of Flanders with the locations
 main_map <- ggplot() +
   theme_bw() + 
-  geom_sf(data = st_geometry(gemeentes %>% st_transform(crs=4326)), colour = "grey", fill=NA, lwd = .5) +
-  geom_sf(data = site.sf, shape=19, size = 1, alpha=8)+
+  geom_sf(data = grid_cells_filtered, lwd = 0.5, colour = "grey", fill = NA) +
+  geom_sf(data = st_geometry(provincies %>% st_transform(crs=4326)), colour = "black", fill=NA, lwd = .5) +
+  geom_sf(data = site.sf, shape=19, size = 1, alpha=8, colour = "darkgreen")+
   scale_x_continuous(limits = c(2.66, 5.8), position="top") +
   scale_y_continuous(limits = c(50.15, 51.48)) +
   annotation_scale(location="tl", width_hint = 0.6,
-                   pad_y = unit(6.9, "cm")) +
+                   pad_y = unit(5.4, "cm"), pad_x = unit(0.5, "cm")) + 
   annotation_north_arrow(location = "tl", which_north = "true", 
                          pad_x = unit(0.1, "cm"), pad_y = unit(0.4, "cm"),
                          style = north_arrow_fancy_orienteering)
 
 main_map
 
-
 #making a map of NW-Europe for situating Flanders
-
-
 world <- ne_countries(scale="large", returnclass="sf")
 target_crs <- 4326#"+proj=longlat" #+proj=longlat CRS("EPSG:4236)
 
@@ -227,6 +244,7 @@ world_wgs84 <- world %>% st_transform(crs = target_crs)
 inset_map <- world_wgs84 %>% ggplot() + geom_sf() + #map of europe
   scale_x_continuous(limits = c(-5, 15)) +
   scale_y_continuous(limits = c(48, 55)) +
+  # square around flanders
   geom_rect(data = data.frame(),
             aes(xmin = bbox_VL$xmin, xmax = bbox_VL$xmax, ymin = bbox_VL$ymin, ymax = bbox_VL$ymax),
             colour = "black", fill=NA, size=1)+
@@ -245,15 +263,16 @@ ggdraw(main_map) +
     # The distance along a (0,1) x-axis to draw the left edge of the plot
     x = 0.605, 
     # The distance along a (0,1) y-axis to draw the bottom edge of the plot
-    y = 0.12,
+    y = 0.145,
     # The width and height of the plot expressed as proportion of the entire ggdraw object
     width = 0.35, 
     height = 0.35)
-
-# ggsave("figure 1.jpeg", width = 13.9, height = 6,  units = "cm", dpi=600)
+#ggsave("figure 1.jpeg", width = 13.9, height = 11, units = "cm", dpi=600)
 ```
 
 
+    
+    
 # CALCULATE BEGIN, PEAK, END
 
 ```{r median 5th and 95th percentile}
@@ -261,7 +280,7 @@ bufo <- bufo_bufo %>%
   dplyr::rename(year = jaar) %>%
   group_by(year, site_id, datum) %>%
   dplyr::summarise(count = sum(count), # sum of dead and migrating toads
-                   migr_toads = max(cumulative_count), # total migrated toads on that day
+                   migr_toads = max(cumulative_count), # total migrated toads on that day (passed migration + present day)
                    ) 
 
 # Get the estimates for the median, 5th and 95th percentile per id and year
@@ -298,7 +317,7 @@ peak_data <- merged_bufo %>%
   # select the first day where the amount of toads crossed is higher than the
   # median count
   filter(cumulative_count >= median_count) %>%
-  # The day of the year as a decimal number (range 001 to 366).
+  # The day of the year as a decimal number (range 001 to 365/366).
   summarise(peak = as.numeric(format(min(datum), format = "%j"))) 
 
 # find the date for the start of the migration, similar to the peak
@@ -325,7 +344,7 @@ phenology <- begin_data %>%
             by = c("site_id", "year")) %>%
   mutate(year_center = year - 2020,
          site_id = as.factor(site_id),
-         migration_length = end - onset + 1) %>% # filter(tot_days > 1)
+         migration_length = end - onset + 1) %>% 
   filter(migration_length > 1)
 ```
 
@@ -337,15 +356,21 @@ Models testing whether the beginning / peak / end of breeding migrations shifted
 over the years. As the migration may shift depending on the location, we use a 
 random intercept for each location.
 
+
+
 ## MIXED MODELS
 
 ### ONSET
+
 ```{r model of STARTdate}
 mm_onset <- lmer(onset ~ year_center + (1|site_id),
               data = phenology)
+# each population has a different intercept but the slopes stay the same
 
+# is the shift consistent over the populations?
 complex <- lmer(onset ~ year_center + (1+year_center|site_id),
-              data = phenology) # is the change consistent
+              data = phenology) 
+# each population can have its own slope
 
 summary(mm_onset)
 ```
@@ -389,8 +414,8 @@ summary(mm_peak)
 
 ```{r model selection of PEAK}
 # Are the populations reacting in the same way
-#H0: You should use the complex model.
-#Ha: You should use the nested model.
+#H0: You should use the nested model.
+#Ha: You should use the complex model.
 lrtest(mm_peak, complex_peak)
 ```
 
@@ -428,8 +453,8 @@ sum(sum_end$coefficients[, "Pr(>|t|)"] <= 0.05)
 
 ```{r model selection of END}
 # Are the populations reacting in the same way
-#H0: You should use the complex model.
-#Ha: You should use the nested model.
+#H0: You should use the nested model.
+#Ha: You should use the complex model.
 lrtest(mm_end, complex_end)
 ```
 
@@ -457,6 +482,7 @@ shapiro.test(residuals)
 
 ### DURATION
 ```{r model of migration DURATION}
+# Are the populations reacting in the same way?
 mm_length <- lmer(migration_length ~ year_center + (1|site_id),
                   data = phenology)
 complex_length <- lmer(migration_length ~ year_center + (1+year_center|site_id),
@@ -464,24 +490,29 @@ complex_length <- lmer(migration_length ~ year_center + (1+year_center|site_id),
 summary(mm_length)
 ```
 
+
+
 ```{r model selection of DURATION}
 # Are the populations reacting in the same way?
-#H0: You should use the complex model.
-#Ha: You should use the nested model.
+# Do the populations have the same duration?
+#H0: You should use the nested model. (y)
+#Ha: You should use the complex model. (n)
 lrtest(mm_length, complex_length)
 ```
 
-```{r is there variation over the years in duration}
-gamm_int <- gam(migration_length ~ s(year_center) + s(site_id, bs = "re") + s(site_id,
-    year_center, bs = "re"), data = phenology, method = "REML")
-lmm_int <- gam(migration_length ~ year_center + s(site_id, bs = "re") + s(site_id,
-    year_center, bs = "re"), data = phenology, method = "REML")
 
-# Is the duration variable?
-#H0: You should use the complex model.
-#Ha: You should use the nested model.
+
+```{r is there variation over the years in duration}
+gamm_int <- gam(migration_length ~ s(year_center) + s(site_id, bs = "re"), data = phenology, method = "ML")
+lmm_int <- gam(migration_length ~ year_center + s(site_id, bs = "re"), data = phenology, method = "ML")
+
+# Is the duration variable over the years?
+#H0: You should use the nested model. (n)
+#Ha: You should use the complex model. (y)
 lrtest(lmm_int, gamm_int)
 ```
+
+
 
 ```{r duration assumptions}
 plot(phenology$year_center, phenology$migration_length)
@@ -502,8 +533,37 @@ hist(residuals, breaks = 60)
 shapiro.test(residuals)
 ```
 
-# MODEL VISUALISATION
+
+
+```{r visualize trend}
+gam_length <- gam(migration_length ~ s(year_center), 
+                  data = phenology,
+                  family = gaussian())
+
+# make dataset to Visualize the GAM using ggplot2
+intercept <- gam_length$coefficients[1]
+pred <- predict(gam_length, newdata = phenology, type = "terms", se.fit = TRUE)
+
+plot_data <- as.data.frame(pred$fit)
+plot_data <- plot_data %>%
+  mutate(year_center = phenology$year_center)
+
+ggplot(plot_data, aes(x = year_center + 2020, y = `s(year_center)` + intercept)) +
+  theme_classic() +
+  labs(x = "Year", y = "Migration length (# days)") + #title = "Change in migration length", 
+  geom_point(data = phenology, aes(x = year, y = migration_length), size = 1) +
+  geom_line(colour = "darkgoldenrod", size = 1)
+#ggsave("figure 2.jpeg", width = 13.9, height = 8,  units = "cm", dpi=600)
+```
+
+
+
+
+
+
+# MODEL VISUALIZATION
 ```{r plots dates}
+# save models
 phenology$pred_start <- predict(mm_onset, newdata = phenology, re.form = NA)
 phenology$pred_end <- predict(mm_end, newdata = phenology, re.form = NA)
 phenology$pred_peak <- predict(mm_peak, newdata = phenology, re.form = NA)
@@ -530,7 +590,7 @@ ggplot(plot_pheno, aes(x = year, y = day_of_year, color = date))  +
   labs(x = "Year", y = "Migration date (day of the year)")
 
 
-# ggsave("figure 2.jpeg", width = 13.9, height = 8,  units = "cm", dpi=600)
+# ggsave("figure 3.jpeg", width = 13.9, height = 8,  units = "cm", dpi=600)
 ```
 
 
@@ -580,31 +640,34 @@ Based on the correlogram, there is no spatial correlation.
 # RELATION WITH TEMPERATURE
 
 ```{r read in temperature data and merge}
-temperature <- read_xlsx("temperature.xlsx")
+temp_data <- read_xlsx("temperature.xlsx")
 
 # adapt to the right structure
-temperature$TEMP_CH_0H_MIN <- as.numeric(temperature$TEMP_CH_0H_MIN)
-temperature <- na.omit(temperature)
-temperature$TEMP_CH_0H_MAX <- as.numeric(temperature$TEMP_CH_0H_MAX)
-temperature$TEMP_CH_0H_AVG <- as.numeric(temperature$TEMP_CH_0H_AVG)
-temperature$TIMESTAMP <- as.Date(temperature$TIMESTAMP, format = "%Y-%m-%d")
+temp_data$TEMP_CH_0H_MIN <- as.numeric(temp_data$TEMP_CH_0H_MIN)
+temp_data <- na.omit(temp_data)
+temp_data$TEMP_CH_0H_MAX <- as.numeric(temp_data$TEMP_CH_0H_MAX)
+temp_data$TEMP_CH_0H_AVG <- as.numeric(temp_data$TEMP_CH_0H_AVG)
+temp_data$TIMESTAMP <- as.Date(temp_data$TIMESTAMP, format = "%Y-%m-%d")
 
 # Extract day of the year
-temperature$day_of_year <- as.integer(yday(temperature$TIMESTAMP))
+temp_data$day_of_year <- as.integer(yday(temp_data$TIMESTAMP))
 
 # Extract year
-temperature$year <- as.integer(year(temperature$TIMESTAMP))
+temp_data$year <- as.integer(year(temp_data$TIMESTAMP))
 
 # add temperature meterological winter
 ## Make sure the winter is included in the same toad season
-temperature$year <- ifelse(format(temperature$TIMESTAMP, "%m") == 12, 
-                          temperature$year + 1, 
-                          temperature$year)
-temperature$day_of_year <- ifelse(format(temperature$TIMESTAMP, "%m") == 12, 
-                          temperature$day_of_year - 365, 
-                          temperature$day_of_year)
+temp_data$year <- ifelse(format(temp_data$TIMESTAMP, "%m") == 12, 
+                          temp_data$year + 1, 
+                          temp_data$year)
+
+# dates of Dec come before Jan, Feb, ... The day of the year also needs to be
+# smaller (negative).
+temp_data$day_of_year <- ifelse(format(temp_data$TIMESTAMP, "%m") == 12, 
+                          temp_data$day_of_year - 365, 
+                          temp_data$day_of_year)
 ## select only winter months
-meteorological_winter <- subset(temperature, 
+meteorological_winter <- subset(temp_data, 
                                 format(TIMESTAMP, "%m") %in% c("12", "01", "02"))
 
 # Calculate the mean temperature for each year
@@ -615,98 +678,131 @@ names(meteorological_winter) <- c("year", "winter_min",
                                   "winter_avg", "winter_max")
 ```
 
-```{r ONSETdata}
+```{r read in temperature grid}
+bufo_sites_grid <- read_delim("climateGrid/bufo_sites_gridID_KMI.csv", delim = ",") %>%
+  mutate(site_id = as.factor(site_id))
+
+# make one dataset of the temperatures per grid
+
+files <- list.files(path = "climateGrid/climateGrid", pattern = "*.csv", full.names = TRUE) 
+# list of datafiles of grid temperature per month
+data_list <- lapply(files, function(x) read.csv(x, sep = ";"))
+temperature_grid <- do.call(rbind, data_list)
+
+# correct structure
+temperature_grid$date <- as.Date(temperature_grid$day, format = "%Y/%m/%d")
+
+# Extract day of the year
+temperature_grid$day_of_year <- as.integer(yday(temperature_grid$date))
+
+# Extract year
+temperature_grid$year <- as.integer(year(temperature_grid$date))
+
+# calculate meteorological winter
+## Make sure the winter is included in the same toad season
+temperature_grid$year <- ifelse(format(temperature_grid$date, "%m") == 12, 
+                          temperature_grid$year + 1, 
+                          temperature_grid$year)
+temperature_grid$day_of_year <- ifelse(format(temperature_grid$date, "%m") == 12, 
+                          temperature_grid$day_of_year - 365, 
+                          temperature_grid$day_of_year)
+
+met_winter <- temperature_grid %>%
+  filter(format(date, "%m") %in% c("12", "01", "02")) %>%
+  group_by(pixel_id, year) %>%
+  summarise(winter_avg = mean(temp_avg)) %>%
+  ungroup()
+```
+
+```{r calculate monthly - weekly avg}
 onset_temp <- phenology %>%
-  left_join(meteorological_winter, by = "year") %>%
-  left_join(temperature, by = c("year" = "year", "onset" = "day_of_year")) %>%
-  dplyr::rename(T_min = TEMP_CH_0H_MIN,
-                T_avg = TEMP_CH_0H_AVG, 
-                T_max = TEMP_CH_0H_MAX)
+  # pixelID of each location (HubName)
+  left_join(bufo_sites_grid %>% select(site_id, HubName), by = "site_id") %>%
+  # get the temperature for each year, per location
+  # locations closeby (in same pixelID) will get the same value
+  left_join(met_winter, by = c("year" = "year", "HubName" = "pixel_id"))
+
+peak_temp <- onset_temp
+end_temp <- onset_temp
 
 onset_temp$mean_week <-  rep(NA, nrow(onset_temp))
 onset_temp$mean_month <-  rep(NA, nrow(onset_temp))
+onset_temp$min_week <-  rep(NA, nrow(onset_temp))
+onset_temp$min_month <-  rep(NA, nrow(onset_temp))
+onset_temp$max_week <-  rep(NA, nrow(onset_temp))
+onset_temp$max_month <-  rep(NA, nrow(onset_temp))
+
+peak_temp$mean_week <-  rep(NA, nrow(onset_temp))
+peak_temp$mean_month <-  rep(NA, nrow(onset_temp))
+
+end_temp$mean_week <-  rep(NA, nrow(onset_temp))
+end_temp$mean_month <-  rep(NA, nrow(onset_temp))
 
 for (index in 1:nrow(onset_temp)) {
   # select the data from the dataset
   observation <- onset_temp[index, ]
   
-  # select the year and the date
+  # select the year
   jaar <- observation$year
+  
+  temperature <- subset(temperature_grid, pixel_id == observation$HubName)
+  temperature <- temperature[temperature$year == jaar,]
+  
+  
+  
+  # onset ----
   dag <- observation$onset
   
   # calculate the mean avg temperature a week/month before the onset
-  weekly_T <- subset(temperature[temperature$year == jaar,], 
+  weekly_T <- subset(temperature, 
                      day_of_year >= dag - 7 & day_of_year <= dag)
-  monthly_T <- subset(temperature[temperature$year == jaar,],
+  monthly_T <- subset(temperature,
                       day_of_year >= dag - 30 & day_of_year <= dag)
   
   # save mean temperature
-  onset_temp[index, ]$mean_week <- mean(weekly_T$TEMP_CH_0H_AVG)
-  onset_temp[index, ]$mean_month <- mean(monthly_T$TEMP_CH_0H_AVG)
-}
-```
+  onset_temp[index, ]$mean_week <- mean(weekly_T$temp_avg)
+  onset_temp[index, ]$mean_month <- mean(monthly_T$temp_avg)
 
-
-
-```{r PEAKdata}
-peak_temp <- phenology %>%
-  left_join(meteorological_winter, by = "year") %>%
-  left_join(temperature, by = c("year" = "year", "peak" = "day_of_year")) %>%
-  dplyr::rename(T_min = TEMP_CH_0H_MIN,
-                T_avg = TEMP_CH_0H_AVG, 
-                T_max = TEMP_CH_0H_MAX)
-
-peak_temp$mean_week <-  rep(NA, nrow(peak_temp))
-peak_temp$mean_month <-  rep(NA, nrow(peak_temp))
-
-for (index in 1:nrow(peak_temp)) {
-  # select the data from the dataset
-  observation <- peak_temp[index, ]
+  onset_temp[index, ]$min_week <- mean(weekly_T$temp_min)
+  onset_temp[index, ]$min_month <- mean(monthly_T$temp_min)
   
-  # select the year and the date
-  jaar <- observation$year
+  onset_temp[index, ]$max_week <- mean(weekly_T$temp_max)
+  onset_temp[index, ]$max_month <- mean(monthly_T$temp_max)
+  
+  
+  
+  # peak ----
   dag <- observation$peak
   
-  weekly_T <- subset(temperature[temperature$year == jaar,], 
+  # calculate the mean avg temperature a week/month before the onset
+  weekly_T <- subset(temperature, 
                      day_of_year >= dag - 7 & day_of_year <= dag)
-  monthly_T <- subset(temperature[temperature$year == jaar,],
+  monthly_T <- subset(temperature,
                       day_of_year >= dag - 30 & day_of_year <= dag)
   
-  peak_temp[index, ]$mean_week <- mean(weekly_T$TEMP_CH_0H_AVG)
-  peak_temp[index, ]$mean_month <- mean(monthly_T$TEMP_CH_0H_AVG)
-}
-```
-
-```{r ENDdata}
-end_temp <- phenology %>%
-  left_join(meteorological_winter, by = "year") %>%
-  left_join(temperature, by = c("year" = "year", "end" = "day_of_year")) %>%
-  dplyr::rename(T_min = TEMP_CH_0H_MIN,
-                T_avg = TEMP_CH_0H_AVG, 
-                T_max = TEMP_CH_0H_MAX)
-
-end_temp$mean_week <-  rep(NA, nrow(end_temp))
-end_temp$mean_month <-  rep(NA, nrow(end_temp))
-
-for (index in 1:nrow(end_temp)) {
-  # select the data from the dataset
-  observation <- end_temp[index, ]
+  # save mean temperature
+  peak_temp[index, ]$mean_week <- mean(weekly_T$temp_avg)
+  peak_temp[index, ]$mean_month <- mean(monthly_T$temp_avg)
   
-  # select the year and the date
-  jaar <- observation$year
+  
+  
+  # end ----
   dag <- observation$end
   
   # calculate the mean avg temperature a week/month before the onset
-  weekly_T <- subset(temperature[temperature$year == jaar,], 
+  weekly_T <- subset(temperature, 
                      day_of_year >= dag - 7 & day_of_year <= dag)
-  monthly_T <- subset(temperature[temperature$year == jaar,],
+  monthly_T <- subset(temperature,
                       day_of_year >= dag - 30 & day_of_year <= dag)
   
   # save mean temperature
-  end_temp[index, ]$mean_week <- mean(weekly_T$TEMP_CH_0H_AVG)
-  end_temp[index, ]$mean_month <- mean(monthly_T$TEMP_CH_0H_AVG)
+  end_temp[index, ]$mean_week <- mean(weekly_T$temp_avg)
+  end_temp[index, ]$mean_month <- mean(monthly_T$temp_avg)
 }
 ```
+
+
+
 
 
 ## MODEL
@@ -725,13 +821,34 @@ onset_winter <- lmer(onset ~ winter_avg + (1|site_id),
 summary(onset_winter)
 ```
 
+
+
 ```{r Tonset assumptions}
-plot(onset_temp$winter_avg, onset_temp$onset)
-lines(smooth.spline(onset_temp$onset~onset_temp$winter_avg))
+# week
+plot(onset_temp$mean_week, onset_temp$onset)
+lines(smooth.spline(onset_temp$onset~onset_temp$mean_week))
 
 # Residual Plot
-residuals <- resid(onset_winter)
-fitted_values <- fitted(onset_winter)
+residuals <- resid(onset_week)
+fitted_values <- fitted(onset_week)
+
+
+#month
+plot(onset_temp$mean_month, onset_temp$onset)
+lines(smooth.spline(onset_temp$onset~onset_temp$mean_month))
+
+# Residual Plot
+residuals <- resid(onset_month)
+fitted_values <- fitted(onset_month)
+
+
+# winter
+plot(onset_temp$mean_month, onset_temp$onset)
+lines(smooth.spline(onset_temp$onset~onset_temp$mean_month))
+
+# Residual Plot
+residuals <- resid(onset_month)
+fitted_values <- fitted(onset_month)
 
 # Plot residuals against fitted values
 plot(fitted_values, residuals, xlab = "Fitted Values", ylab = "Residuals", main = "Residual Plot")
@@ -762,6 +879,25 @@ summary(peak_winter)
 
 
 ```{r Tpeak assumptions}
+# week
+plot(peak_temp$mean_week, peak_temp$peak)
+lines(smooth.spline(peak_temp$peak ~ peak_temp$mean_week))
+
+# Residual Plot
+residuals <- resid(peak_week)
+fitted_values <- fitted(peak_week)
+
+
+# month
+plot(peak_temp$mean_month, peak_temp$peak)
+lines(smooth.spline(peak_temp$peak ~ peak_temp$mean_month))
+
+# Residual Plot
+residuals <- resid(peak_month)
+fitted_values <- fitted(peak_month)
+
+
+# winter
 plot(peak_temp$winter_avg, peak_temp$peak)
 lines(smooth.spline(peak_temp$peak ~ peak_temp$winter_avg))
 
@@ -798,6 +934,25 @@ summary(end_winter)
 ```
 
 ```{r Tend assumptions}
+# week
+plot(end_temp$mean_week, end_temp$end)
+lines(smooth.spline(end_temp$end ~ end_temp$mean_week))
+
+# Residual Plot
+residuals <- resid(end_week)
+fitted_values <- fitted(end_week)
+
+
+# month
+plot(end_temp$mean_month, end_temp$end)
+lines(smooth.spline(end_temp$end ~ end_temp$mean_month))
+
+# Residual Plot
+residuals <- resid(end_month)
+fitted_values <- fitted(end_month)
+
+
+# winter
 plot(end_temp$winter_avg, end_temp$end)
 lines(smooth.spline(end_temp$end ~ end_temp$winter_avg))
 
@@ -853,15 +1008,16 @@ plot_temp <- onset_temp %>%
   pivot_longer(cols = c(winter_avg, mean_month, mean_week), 
                names_to = "period", 
                values_to = "temperature") %>%
-  select(site_id, onset, period, temperature, pred_week, pred_month, pred_winter)
+  dplyr::select(site_id, onset, period, temperature, pred_week, pred_month, pred_winter)
 plot_temp$period <- factor(plot_temp$period, levels = c("winter_avg", "mean_month", "mean_week"))
 
-ggplot(plot_temp, aes(x = temperature, y = onset, color = period))  +  
+timing_climate <- ggplot(plot_temp, aes(x = temperature, y = onset, color = period))  +  
   theme_classic() +
-  theme(legend.position = c(0.123, 0.22)) +
-  scale_color_manual(values = c("mean_week" = "darkgreen", 
+  scale_color_manual(labels = c("winter", "month", "week"),
+                     values = c("mean_week" = "darkgreen", 
                                 "winter_avg" = "deepskyblue2", 
                                 "mean_month" = "firebrick")) +
+  #theme(legend.position = c(0.16, 0.12)) + #c(x, y)
   geom_point(size = 1) +
   geom_line(data = plot_temp[plot_temp$period == "mean_week",], aes(y = pred_week), 
             color = "darkgreen", size = 1) +
@@ -869,9 +1025,8 @@ ggplot(plot_temp, aes(x = temperature, y = onset, color = period))  +
             color = "firebrick", size = 1) +
   geom_line(data = plot_temp[plot_temp$period == "winter_avg",], aes(y = pred_winter), 
             color = "deepskyblue2", size = 1) + 
-  labs(x = "Temperature (°C)", y = "Onset migration date (day of the year)")
+  labs(x = "Temperature (°C)", y = "Onset migration date \n (day of the year)")
   #, title = "Shift in migration phenology of the common toad (Bufo bufo)"
-
-
-ggsave("figure 3.jpeg", width = 13.9, height = 8,  units = "cm", dpi=600)
 ```
+
+
